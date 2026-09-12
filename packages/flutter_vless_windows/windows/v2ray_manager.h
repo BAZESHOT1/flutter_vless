@@ -22,22 +22,20 @@ class V2rayManager {
  public:
   static V2rayManager& GetInstance();
 
-  bool Start(const std::string& config, bool proxy_only);
+  // >>> FLUTTER_VLESS_TUN: добавлен use_xray_tun
+  bool Start(const std::string& config, bool proxy_only, bool use_xray_tun = false);
+  // <<< FLUTTER_VLESS_TUN
   void Stop();
   bool IsRunning() const;
 
-  // Stats
   void GetTrafficStats(int64_t& upload, int64_t& download);
-  
-  // Delay measurement
+
   std::future<int> GetServerDelayAsync(const std::string& config, const std::string& url);
   int GetServerDelay(const std::string& config, const std::string& url);
   int GetConnectedServerDelay(const std::string& url);
-  
-  // Version
+
   std::string GetCoreVersion();
 
-  // Bounded stdout/stderr from the current or most recent native session.
   std::string GetProviderDebugSnapshot();
 
  private:
@@ -47,18 +45,19 @@ class V2rayManager {
   V2rayManager(const V2rayManager&) = delete;
   V2rayManager& operator=(const V2rayManager&) = delete;
 
-  // Helper methods
   void RunV2ray();
   bool ValidateConfig(const std::string& config);
   std::string ModifyConfigForWindows(const std::string& config, bool proxy_only);
-  
-  // Thread synchronization and state
+
   std::atomic<bool> is_running_{false};
   std::thread v2ray_thread_;
   std::string current_config_;
   bool proxy_only_ = false;
-  
-  // Service delegates
+
+  // >>> FLUTTER_VLESS_TUN: запоминаем режим
+  bool use_xray_tun_ = false;
+  // <<< FLUTTER_VLESS_TUN
+
   std::unique_ptr<ProxyService> proxy_service_;
   std::unique_ptr<VpnService> vpn_service_;
 };
