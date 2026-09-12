@@ -73,7 +73,7 @@ VpnService::VpnService() {
   if (!tun2socks_executable_path_.empty()) {
     std::cerr << "VpnService: Found Tun2Socks executable at: " << tun2socks_executable_path_ << std::endl;
   } else {
-    std::cerr << "VpnService: WARNING - Tun2Socks executable not found!" << std::endl;
+    std::cerr << "VpnService: NOTE - Tun2Socks executable not found (only needed for legacy VPN mode)" << std::endl;
   }
 }
 
@@ -134,7 +134,6 @@ bool VpnService::StartXrayTun(const std::string& config) {
 
 void VpnService::RunXrayTun() {
   // Просто записываем конфиг и запускаем Xray как есть.
-  // Никаких InjectApiConfig / BindDirectOutbounds / netsh / route.
   fs::path config_path;
   if (!WriteConfigToFile(current_config_, config_path)) {
     std::cerr << "VpnService: Failed to write Xray TUN config" << std::endl;
@@ -155,11 +154,9 @@ void VpnService::RunXrayTun() {
 
   std::cerr << "VpnService: Xray native TUN mode started successfully" << std::endl;
 
-  // Xray сам поднимет TUN и добавит маршруты через autoSystemRoutingTable.
-  // Дадим ему несколько секунд на инициализацию.
+  // Даём Xray время поднять TUN и добавить маршруты.
   std::this_thread::sleep_for(std::chrono::seconds(5));
 
-  // Запускаем сбор статистики (если в конфиге включён API stats).
   if (is_running_.load()) {
     stats_thread_ = std::thread(&VpnService::UpdateTrafficStats, this);
   }
@@ -204,7 +201,6 @@ bool VpnService::IsRunning() const {
 }
 
 void VpnService::RunVpn() {
-  // ... (существующий код без изменений, как в оригинале)
   std::string config_with_api = InjectApiConfig(current_config_);
   const auto outbound_interface = DefaultInterfaceName();
   if (config_with_api.empty() || !outbound_interface ||
@@ -347,9 +343,543 @@ void VpnService::RunVpn() {
   StopProcesses();
 }
 
-// Остальные методы StartXrayProcess, StartTun2SocksProcess, StopProcesses,
-// InjectApiConfig, RunXrayApiCommand, GetTrafficStats, UpdateTrafficStats,
-// WriteConfigToFile, FindXrayExecutable, FindTun2SocksExecutable,
-// FindXrayAssets, ExtractServerAddress, ResolveToIP, GetDefaultGateway
-// ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ (копируй из оригинала).
-// Единственное: в StopProcesses добавь сброс use_xray_tun_ = false; (опционально).
+bool VpnService::StartXrayProcess(const std::string& config_path) {
+  if (xray_executable_path_.empty() || !fs::exists(xray_executable_path_)) {
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Windows VPN Xray executable is unavailable");
+    return false;
+  }
+  xray_process_ = std::make_unique<ProcessHandle>();
+
+  std::string command_line = "\"" + xray_executable_path_.string() + "\" -config \"" + config_path + "\"";
+  std::vector<char> cmd_buffer(command_line.begin(), command_line.end());
+  cmd_buffer.push_back('\0');
+
+  HANDLE hChildStdOutRead = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdOutWrite = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdErrRead = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdErrWrite = INVALID_HANDLE_VALUE;
+
+  SECURITY_ATTRIBUTES saAttr;
+  saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+  saAttr.bInheritHandle = TRUE;
+  saAttr.lpSecurityDescriptor = NULL;
+
+  if (!CreatePipe(&hChildStdOutRead, &hChildStdOutWrite, &saAttr, 0)) {
+    std::cerr << "VPN Service: Failed to create Xray stdout pipe" << std::endl;
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows VPN Xray stdout pipe");
+  } else {
+    SetHandleInformation(hChildStdOutRead, HANDLE_FLAG_INHERIT, 0);
+  }
+
+  if (!CreatePipe(&hChildStdErrRead, &hChildStdErrWrite, &saAttr, 0)) {
+    std::cerr << "VPN Service: Failed to create Xray stderr pipe" << std::endl;
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows VPN Xray stderr pipe");
+  } else {
+    SetHandleInformation(hChildStdErrRead, HANDLE_FLAG_INHERIT, 0);
+  }
+
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+  si.wShowWindow = SW_HIDE;
+  si.hStdOutput = hChildStdOutWrite != INVALID_HANDLE_VALUE ? hChildStdOutWrite : GetStdHandle(STD_OUTPUT_HANDLE);
+  si.hStdError = hChildStdErrWrite != INVALID_HANDLE_VALUE ? hChildStdErrWrite : GetStdHandle(STD_ERROR_HANDLE);
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION pi = {};
+
+  std::string working_dir = xray_executable_path_.parent_path().string();
+
+  auto assets_dir = FindXrayAssets(xray_executable_path_);
+  if (assets_dir && *assets_dir != xray_executable_path_.parent_path()) {
+    SetEnvironmentVariableA("XRAY_LOCATION_ASSET", assets_dir->string().c_str());
+  }
+
+  if (!CreateProcessA(NULL, cmd_buffer.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, working_dir.c_str(), &si, &pi)) {
+    const DWORD error = GetLastError();
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows VPN Xray process (Win32 error " +
+                       std::to_string(error) + ")");
+    if (hChildStdOutRead != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutRead);
+    if (hChildStdOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutWrite);
+    if (hChildStdErrRead != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrRead);
+    if (hChildStdErrWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrWrite);
+    return false;
+  }
+
+  if (hChildStdOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutWrite);
+  if (hChildStdErrWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrWrite);
+
+  xray_process_->hProcess = reinterpret_cast<std::uintptr_t>(pi.hProcess);
+  xray_process_->hThread = reinterpret_cast<std::uintptr_t>(pi.hThread);
+  xray_process_->hStdOutRead = reinterpret_cast<std::uintptr_t>(hChildStdOutRead);
+  xray_process_->hStdErrRead = reinterpret_cast<std::uintptr_t>(hChildStdErrRead);
+
+  const auto xray_diagnostics_generation =
+      flutter_vless::DiagnosticsLog::Instance().CurrentGeneration();
+  auto reader = [xray_diagnostics_generation](std::uintptr_t readHandlePtr,
+                                              const char* label) {
+    HANDLE readHandle = reinterpret_cast<HANDLE>(readHandlePtr);
+    if (readHandle == INVALID_HANDLE_VALUE || readHandle == nullptr) return;
+    const DWORD bufSize = 4096;
+    std::vector<char> buffer(bufSize);
+    std::string pending;
+    DWORD bytesRead = 0;
+    while (true) {
+      BOOL result = ReadFile(readHandle, buffer.data(), bufSize, &bytesRead, nullptr);
+      if (!result || bytesRead == 0) break;
+      const std::string chunk(buffer.data(), bytesRead);
+      std::cerr << "[Xray " << label << "] " << chunk;
+      pending.append(chunk);
+      std::size_t newline = std::string::npos;
+      while ((newline = pending.find('\n')) != std::string::npos) {
+        flutter_vless::DiagnosticsLog::Instance().Append(
+            xray_diagnostics_generation, std::string("xray-") + label,
+            pending.substr(0, newline));
+        pending.erase(0, newline + 1);
+      }
+      if (pending.size() > 32 * 1024) {
+        std::size_t start = pending.size() - 16 * 1024;
+        while (start < pending.size() &&
+               (static_cast<unsigned char>(pending[start]) & 0xC0) == 0x80) {
+          ++start;
+        }
+        pending.erase(0, start);
+      }
+    }
+    if (!pending.empty()) {
+      flutter_vless::DiagnosticsLog::Instance().Append(
+          xray_diagnostics_generation, std::string("xray-") + label,
+          pending);
+    }
+    CloseHandle(readHandle);
+  };
+
+  if (xray_process_->hStdOutRead != 0) {
+    std::thread(reader, xray_process_->hStdOutRead, "stdout").detach();
+    xray_process_->hStdOutRead = 0;
+  }
+  if (xray_process_->hStdErrRead != 0) {
+    std::thread(reader, xray_process_->hStdErrRead, "stderr").detach();
+    xray_process_->hStdErrRead = 0;
+  }
+
+  return true;
+}
+
+bool VpnService::StartTun2SocksProcess(uint16_t socks_port) {
+  tun2socks_process_ = std::make_unique<ProcessHandle>();
+
+  std::string proxy_arg = "socks5://127.0.0.1:" + std::to_string(socks_port);
+  std::string command_line = "\"" + tun2socks_executable_path_.string() +
+                              "\" -device \"flutter_vless_tun\"" +
+                              " -proxy " + proxy_arg +
+                              " -loglevel info";
+
+  std::cerr << "VPN Service: Starting Tun2Socks with command: " << command_line << std::endl;
+
+  std::vector<char> cmd_buffer(command_line.begin(), command_line.end());
+  cmd_buffer.push_back('\0');
+
+  HANDLE hChildStdOutRead = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdOutWrite = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdErrRead = INVALID_HANDLE_VALUE;
+  HANDLE hChildStdErrWrite = INVALID_HANDLE_VALUE;
+
+  SECURITY_ATTRIBUTES saAttr;
+  saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+  saAttr.bInheritHandle = TRUE;
+  saAttr.lpSecurityDescriptor = NULL;
+
+  if (!CreatePipe(&hChildStdOutRead, &hChildStdOutWrite, &saAttr, 0)) {
+    std::cerr << "VPN Service: Failed to create stdout pipe" << std::endl;
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows Tun2Socks stdout pipe");
+  } else {
+    SetHandleInformation(hChildStdOutRead, HANDLE_FLAG_INHERIT, 0);
+  }
+
+  if (!CreatePipe(&hChildStdErrRead, &hChildStdErrWrite, &saAttr, 0)) {
+    std::cerr << "VPN Service: Failed to create stderr pipe" << std::endl;
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows Tun2Socks stderr pipe");
+  } else {
+    SetHandleInformation(hChildStdErrRead, HANDLE_FLAG_INHERIT, 0);
+  }
+
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = hChildStdOutWrite != INVALID_HANDLE_VALUE ? hChildStdOutWrite : GetStdHandle(STD_OUTPUT_HANDLE);
+  si.hStdError = hChildStdErrWrite != INVALID_HANDLE_VALUE ? hChildStdErrWrite : GetStdHandle(STD_ERROR_HANDLE);
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION pi = {};
+
+  if (!CreateProcessA(NULL, cmd_buffer.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    DWORD error = GetLastError();
+    std::cerr << "VPN Service: Failed to launch tun2socks. Error code: " << error << std::endl;
+    std::cerr << "VPN Service: Make sure the application is running as Administrator!" << std::endl;
+    flutter_vless::DiagnosticsLog::Instance().Append(
+        "runtime", "Failed to create Windows Tun2Socks process (Win32 error " +
+                       std::to_string(error) +
+                       "); administrator privileges may be required");
+
+    if (hChildStdOutRead != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutRead);
+    if (hChildStdOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutWrite);
+    if (hChildStdErrRead != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrRead);
+    if (hChildStdErrWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrWrite);
+    return false;
+  }
+
+  if (hChildStdOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdOutWrite);
+  if (hChildStdErrWrite != INVALID_HANDLE_VALUE) CloseHandle(hChildStdErrWrite);
+
+  std::cerr << "VPN Service: Tun2Socks process started successfully (PID: " << pi.dwProcessId << ")" << std::endl;
+
+  tun2socks_process_->hProcess = reinterpret_cast<std::uintptr_t>(pi.hProcess);
+  tun2socks_process_->hThread = reinterpret_cast<std::uintptr_t>(pi.hThread);
+  tun2socks_process_->hStdOutRead = reinterpret_cast<std::uintptr_t>(hChildStdOutRead);
+  tun2socks_process_->hStdErrRead = reinterpret_cast<std::uintptr_t>(hChildStdErrRead);
+
+  const auto tun_diagnostics_generation =
+      flutter_vless::DiagnosticsLog::Instance().CurrentGeneration();
+  auto reader = [tun_diagnostics_generation](std::uintptr_t readHandlePtr,
+                                             const char* label) {
+    HANDLE readHandle = reinterpret_cast<HANDLE>(readHandlePtr);
+    if (readHandle == INVALID_HANDLE_VALUE || readHandle == nullptr) return;
+    const DWORD bufSize = 4096;
+    std::vector<char> buffer(bufSize);
+    std::string pending;
+    DWORD bytesRead = 0;
+    while (true) {
+      BOOL result = ReadFile(readHandle, buffer.data(), bufSize, &bytesRead, nullptr);
+      if (!result || bytesRead == 0) break;
+      const std::string chunk(buffer.data(), bytesRead);
+      std::cerr << "[Tun2Socks " << label << "] " << chunk;
+      pending.append(chunk);
+      std::size_t newline = std::string::npos;
+      while ((newline = pending.find('\n')) != std::string::npos) {
+        flutter_vless::DiagnosticsLog::Instance().Append(
+            tun_diagnostics_generation, std::string("tun2socks-") + label,
+            pending.substr(0, newline));
+        pending.erase(0, newline + 1);
+      }
+      if (pending.size() > 32 * 1024) {
+        std::size_t start = pending.size() - 16 * 1024;
+        while (start < pending.size() &&
+               (static_cast<unsigned char>(pending[start]) & 0xC0) == 0x80) {
+          ++start;
+        }
+        pending.erase(0, start);
+      }
+    }
+    if (!pending.empty()) {
+      flutter_vless::DiagnosticsLog::Instance().Append(
+          tun_diagnostics_generation, std::string("tun2socks-") + label,
+          pending);
+    }
+    CloseHandle(readHandle);
+  };
+
+  if (tun2socks_process_->hStdOutRead != 0) {
+    std::thread(reader, tun2socks_process_->hStdOutRead, "stdout").detach();
+    tun2socks_process_->hStdOutRead = 0;
+  }
+  if (tun2socks_process_->hStdErrRead != 0) {
+    std::thread(reader, tun2socks_process_->hStdErrRead, "stderr").detach();
+    tun2socks_process_->hStdErrRead = 0;
+  }
+
+  return true;
+}
+
+void VpnService::StopProcesses() {
+  for (auto route = capture_routes_.rbegin(); route != capture_routes_.rend(); ++route) {
+    const std::string command = "netsh interface ipv4 delete route " + *route +
+        " \"flutter_vless_tun\" store=active";
+    if (system(command.c_str()) != 0) {
+      flutter_vless::DiagnosticsLog::Instance().Append("runtime", "Could not remove Windows VPN capture route");
+    }
+  }
+  capture_routes_.clear();
+  if (tun2socks_process_) {
+    tun2socks_process_->Close();
+    tun2socks_process_.reset();
+  }
+  if (xray_process_) {
+    xray_process_->Close();
+    xray_process_.reset();
+  }
+}
+
+std::string VpnService::InjectApiConfig(const std::string& config) {
+  return flutter_vless::xray_config::PrepareVpn(config).value_or("");
+}
+
+bool VpnService::RunXrayApiCommand(const std::string& args, std::string& output) {
+  if (xray_executable_path_.empty()) return false;
+
+  std::string command = "\"" + xray_executable_path_.string() + "\" " + args;
+
+  HANDLE hRead, hWrite;
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = NULL;
+
+  if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  si.hStdOutput = hWrite;
+  si.hStdError = hWrite;
+  si.wShowWindow = SW_HIDE;
+
+  PROCESS_INFORMATION pi = {};
+
+  std::vector<char> cmd_buf(command.begin(), command.end());
+  cmd_buf.push_back('\0');
+
+  if (!CreateProcessA(NULL, cmd_buf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    CloseHandle(hRead);
+    CloseHandle(hWrite);
+    return false;
+  }
+
+  CloseHandle(hWrite);
+
+  char buffer[4096];
+  DWORD bytesRead;
+  std::string result;
+
+  while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+    buffer[bytesRead] = '\0';
+    result += buffer;
+  }
+
+  CloseHandle(hRead);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  output = result;
+  return true;
+}
+
+void VpnService::GetTrafficStats(int64_t& upload, int64_t& download) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  upload = total_upload_;
+  download = total_download_;
+}
+
+void VpnService::UpdateTrafficStats() {
+  while (is_running_.load()) {
+    std::string output;
+    std::string args = "api statsquery -server=" + api_address_;
+
+    if (RunXrayApiCommand(args, output)) {
+      int64_t new_uplink = 0;
+      int64_t new_downlink = 0;
+
+      size_t stat_pos = output.find("\"stat\"");
+      if (stat_pos != std::string::npos) {
+        size_t array_start = output.find('[', stat_pos);
+        if (array_start != std::string::npos) {
+          size_t current_pos = array_start + 1;
+
+          while (true) {
+            size_t obj_start = output.find('{', current_pos);
+            if (obj_start == std::string::npos) break;
+
+            size_t obj_end = output.find('}', obj_start);
+            if (obj_end == std::string::npos) break;
+
+            std::string obj_str = output.substr(obj_start, obj_end - obj_start + 1);
+
+            std::string name;
+            std::regex name_pattern("\"name\"\\s*:\\s*\"([^\"]+)\"");
+            std::smatch name_match;
+            if (std::regex_search(obj_str, name_match, name_pattern)) {
+              name = name_match[1].str();
+            }
+
+            int64_t value = 0;
+            std::regex value_pattern("\"value\"\\s*:\\s*(\\d+)");
+            std::smatch value_match;
+            if (std::regex_search(obj_str, value_match, value_pattern)) {
+              value = std::stoll(value_match[1].str());
+            }
+
+            if (!name.empty()) {
+              if (name.find("outbound>>>proxy>>>traffic>>>uplink") != std::string::npos) {
+                new_uplink += value;
+              } else if (name.find("outbound>>>proxy>>>traffic>>>downlink") != std::string::npos) {
+                new_downlink += value;
+              }
+            }
+
+            current_pos = obj_end + 1;
+          }
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        total_upload_ = new_uplink;
+        total_download_ = new_downlink;
+      }
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+}
+
+bool VpnService::WriteConfigToFile(const std::string& config, fs::path& config_path) {
+  try {
+    fs::path temp_dir = fs::temp_directory_path() / "flutter_vless_vpn";
+    fs::create_directories(temp_dir);
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    config_path = temp_dir / ("vpn_config_" + std::to_string(timestamp) + ".json");
+    std::ofstream file(config_path, std::ios::binary);
+    if (!file.is_open()) return false;
+    file << config;
+    return true;
+  } catch (...) { return false; }
+}
+
+std::optional<fs::path> VpnService::FindXrayExecutable() {
+  std::vector<fs::path> search_paths = {
+    fs::current_path() / "xray.exe",
+    fs::current_path() / "xray" / "xray.exe",
+    fs::current_path() / "windows" / "xray" / "xray.exe",
+  };
+
+  char exe_path[MAX_PATH];
+  if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+    fs::path exe_dir = fs::path(exe_path).parent_path();
+    search_paths.push_back(exe_dir / "xray.exe");
+    search_paths.push_back(exe_dir / "xray" / "xray.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "xray.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "xray" / "xray.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "windows" / "xray" / "xray.exe");
+  }
+
+  for (const auto& path : search_paths) {
+    if (fs::exists(path)) return path;
+  }
+  return std::nullopt;
+}
+
+std::optional<fs::path> VpnService::FindTun2SocksExecutable() {
+  std::vector<fs::path> search_paths = {
+    fs::current_path() / "tun2socks.exe",
+    fs::current_path() / "xray" / "tun2socks.exe",
+    fs::current_path() / "windows" / "xray" / "tun2socks.exe",
+  };
+
+  char exe_path[MAX_PATH];
+  if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+    fs::path exe_dir = fs::path(exe_path).parent_path();
+    search_paths.push_back(exe_dir / "tun2socks.exe");
+    search_paths.push_back(exe_dir / "xray" / "tun2socks.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "tun2socks.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "xray" / "tun2socks.exe");
+    search_paths.push_back(exe_dir / "data" / "flutter_assets" / "windows" / "xray" / "tun2socks.exe");
+  }
+
+  for (const auto& path : search_paths) {
+    if (fs::exists(path)) return path;
+  }
+  return std::nullopt;
+}
+
+std::optional<fs::path> VpnService::FindXrayAssets(const fs::path& executable_path) {
+  fs::path exe_dir = executable_path.parent_path();
+  if (fs::exists(exe_dir / "geoip.dat")) return exe_dir;
+  return std::nullopt;
+}
+
+std::string VpnService::ExtractServerAddress(const std::string& config) {
+  auto normalize_address = [](std::string address) -> std::string {
+    if (address.size() > 2 && address.front() == '[') {
+      const size_t closing_bracket = address.find(']');
+      if (closing_bracket != std::string::npos) {
+        return address.substr(1, closing_bracket - 1);
+      }
+    }
+
+    const size_t colon_count = static_cast<size_t>(
+        std::count(address.begin(), address.end(), ':'));
+    if (colon_count == 1) {
+      const size_t colon = address.rfind(':');
+      if (colon != std::string::npos && colon > 0) {
+        return address.substr(0, colon);
+      }
+    }
+
+    return address;
+  };
+
+  std::vector<std::regex> patterns = {
+    std::regex("\"outbounds\"[\\s\\S]{0,2000}?\"address\"\\s*:\\s*\"([^\"]+)\""),
+    std::regex("\"protocol\"\\s*:\\s*\"(?:vless|vmess|trojan|shadowsocks|hysteria)\"[\\s\\S]{0,1000}?\"address\"\\s*:\\s*\"([^\"]+)\""),
+    std::regex("\"vnext\"[\\s\\S]{0,1000}?\"address\"\\s*:\\s*\"([^\"]+)\""),
+    std::regex("\"servers\"[\\s\\S]{0,1000}?\"address\"\\s*:\\s*\"([^\"]+)\""),
+    std::regex("\"protocol\"\\s*:\\s*\"wireguard\"[\\s\\S]{0,2000}?\"endpoint\"\\s*:\\s*\"([^\"]+)\""),
+  };
+
+  std::smatch match;
+  for (const auto& pattern : patterns) {
+    if (std::regex_search(config, match, pattern)) {
+      std::string address = normalize_address(match[1].str());
+      if (address != "127.0.0.1" && address != "localhost" && address != "::1") {
+        std::cerr << "VPN Service: Extracted server address: " << address << std::endl;
+        return address;
+      }
+    }
+  }
+
+  std::cerr << "VPN Service: Could not extract remote server address" << std::endl;
+  return "";
+}
+
+std::string VpnService::ResolveToIP(const std::string& address) {
+  std::regex ip_pattern("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$");
+  if (std::regex_match(address, ip_pattern)) {
+    return address;
+  }
+
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+    return "";
+  }
+
+  struct addrinfo hints = {};
+  struct addrinfo* result = nullptr;
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (getaddrinfo(address.c_str(), nullptr, &hints, &result) == 0 && result != nullptr) {
+    struct sockaddr_in* addr = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
+    std::string ip(ip_str);
+    freeaddrinfo(result);
+    WSACleanup();
+    return ip;
+  }
+
+  if (result) freeaddrinfo(result);
+  WSACleanup();
+  return "";
+}
+
+std::string VpnService::GetDefaultGateway() {
+  return flutter_vless::DefaultIpv4Gateway();
+}
