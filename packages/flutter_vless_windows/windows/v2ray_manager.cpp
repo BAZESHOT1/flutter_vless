@@ -24,42 +24,40 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "version.lib")
 
-// JSON parsing helpers (simple implementation, can be replaced with nlohmann/json)
 namespace {
 namespace json_utils {
   bool IsValidJson(const std::string& json_str) {
-    // Basic JSON validation - check for balanced braces and brackets
     int brace_count = 0;
     int bracket_count = 0;
     bool in_string = false;
     bool escaped = false;
-    
+
     for (char c : json_str) {
       if (escaped) {
         escaped = false;
         continue;
       }
-      
+
       if (c == '\\') {
         escaped = true;
         continue;
       }
-      
+
       if (c == '"') {
         in_string = !in_string;
         continue;
       }
-      
+
       if (in_string) continue;
-      
+
       if (c == '{') brace_count++;
       else if (c == '}') brace_count--;
       else if (c == '[') bracket_count++;
       else if (c == ']') bracket_count--;
-      
+
       if (brace_count < 0 || bracket_count < 0) return false;
     }
-    
+
     return brace_count == 0 && bracket_count == 0 && !in_string;
   }
 }
@@ -79,15 +77,18 @@ V2rayManager& V2rayManager::GetInstance() {
   return instance;
 }
 
-bool V2rayManager::Start(const std::string& config, bool proxy_only) {
+// >>> FLUTTER_VLESS_TUN: реализация с use_xray_tun
+bool V2rayManager::Start(const std::string& config, bool proxy_only, bool use_xray_tun) {
   if (is_running_.load()) {
     Stop();
   }
 
   flutter_vless::DiagnosticsLog::Instance().Reset();
   flutter_vless::DiagnosticsLog::Instance().Append(
-      "runtime", proxy_only ? "Starting Windows proxy-only session"
-                            : "Starting Windows VPN session");
+      "runtime",
+      use_xray_tun ? "Starting Windows native Xray TUN session"
+                   : (proxy_only ? "Starting Windows proxy-only session"
+                                 : "Starting Windows VPN (tun2socks) session"));
 
   if (!ValidateConfig(config)) {
     std::cerr << "Invalid Xray configuration JSON" << std::endl;
@@ -98,16 +99,32 @@ bool V2rayManager::Start(const std::string& config, bool proxy_only) {
 
   current_config_ = config;
   proxy_only_ = proxy_only;
-  
+  use_xray_tun_ = use_xray_tun;
+
+  // НОВЫЙ РЕЖИМ: нативный Xray TUN.
+  // В этом режиме мы НЕ используем tun2socks и НЕ трогаем маршруты вручную —
+  // Xray сам создаст TUN и добавит маршруты через autoSystemRoutingTable.
+  if (use_xray_tun_) {
+    if (!vpn_service_) {
+      flutter_vless::DiagnosticsLog::Instance().Append(
+          "runtime", "VpnService is not initialized");
+      return false;
+    }
+    is_running_.store(true);
+    if (!vpn_service_->StartXrayTun(config)) {
+      is_running_.store(false);
+      return false;
+    }
+    return true;
+  }
+
   if (proxy_only_) {
-    // Proxy Mode: Delegate to ProxyService
     if (proxy_service_) {
       is_running_.store(true);
       return proxy_service_->Start(config);
     }
     return false;
   } else {
-    // VPN Mode: Delegate to VpnService
     std::cerr << "Starting VPN mode with Tun2Socks..." << std::endl;
     if (vpn_service_) {
       is_running_.store(true);
@@ -116,6 +133,7 @@ bool V2rayManager::Start(const std::string& config, bool proxy_only) {
     return false;
   }
 }
+// <<< FLUTTER_VLESS_TUN
 
 void V2rayManager::Stop() {
   if (!is_running_.load()) {
@@ -123,7 +141,17 @@ void V2rayManager::Stop() {
   }
 
   is_running_.store(false);
-  
+
+  // >>> FLUTTER_VLESS_TUN: если это был режим Xray TUN — останавливаем его
+  if (use_xray_tun_) {
+    if (vpn_service_) {
+      vpn_service_->Stop();
+    }
+    use_xray_tun_ = false;
+    return;
+  }
+  // <<< FLUTTER_VLESS_TUN
+
   if (proxy_only_) {
     if (proxy_service_) {
       proxy_service_->Stop();
@@ -136,17 +164,18 @@ void V2rayManager::Stop() {
 }
 
 bool V2rayManager::IsRunning() const {
+  if (use_xray_tun_) {
+    return is_running_.load() && vpn_service_ && vpn_service_->IsRunning();
+  }
   return is_running_.load() && (proxy_only_
       ? (proxy_service_ && proxy_service_->IsRunning())
       : (vpn_service_ && vpn_service_->IsRunning()));
 }
 
 void V2rayManager::RunV2ray() {
-  // VPN Stub: Simulate running state
   std::cerr << "VPN functionality is currently disabled. Printing to console only." << std::endl;
-  
+
   while (is_running_.load()) {
-    // Simulate activity
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 }
@@ -182,21 +211,18 @@ std::string V2rayManager::GetProviderDebugSnapshot() {
   return flutter_vless::DiagnosticsLog::Instance().Snapshot();
 }
 
-/**
- * @brief Retrieves current traffic statistics from the active service.
- * 
- * @param[out] upload Total bytes uploaded.
- * @param[out] download Total bytes downloaded.
- * 
- * @details This function delegates stats retrieval to either ProxyService or VpnService
- * depending on the current mode (proxy_only_ flag).
- * 
- * @note CRITICAL FIX: This method used to only query ProxyService, causing zero stats
- * in VPN mode. Now it correctly checks the mode and queries the appropriate service.
- */
 void V2rayManager::GetTrafficStats(int64_t& upload, int64_t& download) {
+  if (use_xray_tun_) {
+    if (vpn_service_) {
+      vpn_service_->GetTrafficStats(upload, download);
+    } else {
+      upload = 0;
+      download = 0;
+    }
+    return;
+  }
+
   if (proxy_only_) {
-    // Proxy Mode: Get stats from ProxyService
     if (proxy_service_) {
       proxy_service_->GetTrafficStats(upload, download);
     } else {
@@ -204,7 +230,6 @@ void V2rayManager::GetTrafficStats(int64_t& upload, int64_t& download) {
       download = 0;
     }
   } else {
-    // VPN Mode: Get stats from VpnService
     if (vpn_service_) {
       vpn_service_->GetTrafficStats(upload, download);
     } else {
@@ -218,7 +243,6 @@ bool V2rayManager::ValidateConfig(const std::string& config) {
   return json_utils::IsValidJson(config);
 }
 
-// Kept for reference but unused in VPN stub
 std::string V2rayManager::ModifyConfigForWindows(const std::string& config, bool proxy_only) {
   return config;
 }
